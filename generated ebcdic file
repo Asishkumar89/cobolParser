@@ -1,0 +1,192 @@
+"""
+generate_ebcdic.py
+-------------------
+Generates a fixed-length (record_format='F') EBCDIC CP500 data file matching
+the GENERIC_RECORD.cpy copybook (50 bytes/record). Requires: pip install numpy
+
+USAGE
+  # Generate a file of a given total size (bytes), all in one go:
+  python3 generate_ebcdic.py <output_path> <total_bytes>
+
+    Example (1 GB):
+      python3 generate_ebcdic.py generic_record.dat 1000000000
+
+    Example (5 GB):
+      python3 generate_ebcdic.py generic_record.dat 5000000000
+
+  # Generate just one slice of records (useful for producing multiple files
+  # in parallel, or for very large sizes where you want to write in parts):
+  python3 generate_ebcdic.py part <output_path> <start_record> <num_records>
+
+    Example (records 0..9,999,999 -> 500MB part):
+      python3 generate_ebcdic.py part generic_record_part01.dat 0 10000000
+
+total_bytes must be an exact multiple of RECORD_LEN (50). The script will
+tell you if it isn't.
+"""
+import numpy as np
+import sys
+import time
+
+# ---- Record layout (must match GENERIC-RECORD.cpy) ----
+# 05  RECORD-ID       PIC 9(6).            -> 6 bytes  zoned decimal
+# 05  CUSTOMER-NAME   PIC X(20).           -> 20 bytes alphanumeric
+# 05  AMOUNT          PIC S9(7)V99 COMP-3. -> 5 bytes  packed decimal
+# 05  TRANS-DATE      PIC X(8).            -> 8 bytes  alphanumeric (YYYYMMDD)
+# 05  STATUS-CODE     PIC X(1).            -> 1 byte   alphanumeric
+# 05  FILLER          PIC X(10).           -> 10 bytes alphanumeric (spaces)
+RECORD_LEN = 6 + 20 + 5 + 8 + 1 + 10  # 50
+CHUNK = 2_000_000  # records per chunk (~100MB per chunk of output)
+
+STATUS_CODES = np.array([ord(c) for c in "AIP"], dtype=np.uint8)  # Active/Inactive/Pending
+SPACES10 = " " * 10
+FILLER_BYTES = SPACES10.encode("cp500")  # constant 10 bytes
+
+
+def zoned_digits(values, n_digits):
+    """values: int64 array -> (len(values), n_digits) uint8 array of zoned-decimal bytes (0xF0+d)."""
+    n = len(values)
+    digits = np.empty((n, n_digits), dtype=np.uint8)
+    tmp = values.copy()
+    for pos in range(n_digits - 1, -1, -1):
+        digits[:, pos] = (tmp % 10).astype(np.uint8)
+        tmp //= 10
+    return 0xF0 + digits
+
+
+def pack_comp3(values, n_digits):
+    """values: int64 array, non-negative, up to n_digits digits -> packed decimal bytes, positive sign (0xC)."""
+    n = len(values)
+    digits = np.empty((n, n_digits), dtype=np.uint8)
+    tmp = values.copy()
+    for pos in range(n_digits - 1, -1, -1):
+        digits[:, pos] = (tmp % 10).astype(np.uint8)
+        tmp //= 10
+    sign = np.full((n, 1), 0xC, dtype=np.uint8)
+    nibbles = np.concatenate([digits, sign], axis=1)  # n x (n_digits+1), must be even
+    assert nibbles.shape[1] % 2 == 0
+    pairs = nibbles.reshape(n, nibbles.shape[1] // 2, 2)
+    byte_arr = (pairs[:, :, 0] << 4) | pairs[:, :, 1]
+    return byte_arr.astype(np.uint8)
+
+
+def gen_chunk(start_idx, n, rng):
+    # RECORD-ID: sequential 1..999999 wrapping, zoned decimal, 6 digits
+    ids = ((np.arange(start_idx, start_idx + n, dtype=np.int64) % 999999) + 1)
+    id_bytes = zoned_digits(ids, 6)  # n x 6
+
+    # CUSTOMER-NAME: "CUSTOMER" (8) + zero-padded 12-digit id number = 20 chars
+    name_prefix = np.frombuffer(b"CUSTOMER", dtype=np.uint8)  # 8 bytes, constant
+    name_nums = np.arange(start_idx, start_idx + n, dtype=np.int64) % (10**12)
+    name_digits = zoned_digits(name_nums, 12) - 0xF0 + ord('0')  # convert to ASCII '0'-'9' bytes
+    name_ascii = np.empty((n, 20), dtype=np.uint8)
+    name_ascii[:, :8] = name_prefix
+    name_ascii[:, 8:] = name_digits
+    # Convert ASCII bytes -> CP500 via translation table (digits + our fixed letters only)
+    name_bytes = ascii_to_cp500(name_ascii)
+
+    # AMOUNT: S9(7)V99 COMP-3, random 0 .. 999999999 (9 digits incl. 2 implied decimals)
+    amounts = rng.integers(0, 10**9, size=n, dtype=np.int64)
+    amount_bytes = pack_comp3(amounts, 9)  # n x 5
+
+    # TRANS-DATE: YYYYMMDD, random year 2020-2025, fixed valid month/day pool to keep it simple/valid
+    years = rng.integers(2020, 2026, size=n)
+    months = rng.integers(1, 13, size=n)
+    days = rng.integers(1, 29, size=n)  # 28 keeps every month valid
+    date_ascii = np.empty((n, 8), dtype=np.uint8)
+    y_digits = zoned_digits(years.astype(np.int64), 4) - 0xF0 + ord('0')
+    m_digits = zoned_digits(months.astype(np.int64), 2) - 0xF0 + ord('0')
+    d_digits = zoned_digits(days.astype(np.int64), 2) - 0xF0 + ord('0')
+    date_ascii[:, 0:4] = y_digits
+    date_ascii[:, 4:6] = m_digits
+    date_ascii[:, 6:8] = d_digits
+    date_bytes = ascii_to_cp500(date_ascii)
+
+    # STATUS-CODE: random from A/I/P
+    status_ascii = STATUS_CODES[rng.integers(0, 3, size=n)]
+    status_bytes = ascii_to_cp500(status_ascii.reshape(n, 1))
+
+    # FILLER: constant spaces
+    filler_bytes = np.tile(np.frombuffer(FILLER_BYTES, dtype=np.uint8), (n, 1))
+
+    record = np.concatenate(
+        [id_bytes, name_bytes, amount_bytes, date_bytes, status_bytes, filler_bytes], axis=1
+    )
+    assert record.shape[1] == RECORD_LEN
+    return record.astype(np.uint8).tobytes()
+
+
+_ascii_to_cp500_table = None
+
+
+def ascii_to_cp500(arr):
+    global _ascii_to_cp500_table
+    if _ascii_to_cp500_table is None:
+        table = np.zeros(256, dtype=np.uint8)
+        for i in range(256):
+            try:
+                table[i] = bytes([i]).decode("latin1").encode("cp500")[0]
+            except Exception:
+                table[i] = 0x40  # space fallback
+        _ascii_to_cp500_table = table
+    return _ascii_to_cp500_table[arr]
+
+
+def main(out_path, target_bytes):
+    if target_bytes % RECORD_LEN != 0:
+        print(f"ERROR: total_bytes ({target_bytes:,}) is not a multiple of RECORD_LEN ({RECORD_LEN}).")
+        print(f"       Nearest valid sizes: {(target_bytes // RECORD_LEN) * RECORD_LEN:,} or {(target_bytes // RECORD_LEN + 1) * RECORD_LEN:,}")
+        sys.exit(1)
+    n_records = target_bytes // RECORD_LEN
+    rng = np.random.default_rng(42)
+    written = 0
+    t0 = time.time()
+    with open(out_path, "wb", buffering=1024 * 1024 * 8) as f:
+        idx = 0
+        while idx < n_records:
+            n = min(CHUNK, n_records - idx)
+            chunk_bytes = gen_chunk(idx, n, rng)
+            f.write(chunk_bytes)
+            written += len(chunk_bytes)
+            idx += n
+            elapsed = time.time() - t0
+            pct = 100.0 * idx / n_records
+            print(f"{idx:,}/{n_records:,} records ({pct:5.1f}%) - {written/1e9:.3f} GB written - {elapsed:6.1f}s elapsed", flush=True)
+    print(f"DONE. Total bytes written: {written:,} (target {target_bytes:,}), records: {n_records:,}, record_len: {RECORD_LEN}")
+
+
+def gen_part(out_path, start_record, num_records, seed=42):
+    """Generate a single part file covering [start_record, start_record+num_records)."""
+    rng = np.random.default_rng(seed)
+    # advance rng deterministically-ish per part isn't critical for synthetic test data;
+    # each part uses its own seed offset so data still looks varied across parts.
+    rng = np.random.default_rng(seed + start_record)
+    written = 0
+    with open(out_path, "wb", buffering=1024 * 1024 * 8) as f:
+        idx = start_record
+        end = start_record + num_records
+        while idx < end:
+            n = min(CHUNK, end - idx)
+            chunk_bytes = gen_chunk(idx, n, rng)
+            f.write(chunk_bytes)
+            written += len(chunk_bytes)
+            idx += n
+    return written
+
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 5 and sys.argv[1] == "part":
+        # usage: generate_ebcdic.py part <out_path> <start_record> <num_records>
+        out_path = sys.argv[2]
+        start_record = int(sys.argv[3])
+        num_records = int(sys.argv[4])
+        w = gen_part(out_path, start_record, num_records)
+        print(f"PART DONE: {out_path} records=[{start_record},{start_record+num_records}) bytes={w:,}")
+    elif len(sys.argv) >= 3:
+        # usage: generate_ebcdic.py <out_path> <total_bytes>
+        out_path = sys.argv[1]
+        total_bytes = int(sys.argv[2])
+        main(out_path, total_bytes)
+    else:
+        print(__doc__)
+        sys.exit(1)
